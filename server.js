@@ -1,7 +1,40 @@
-const express = require('express');
+// One malformed packet or a momentary network fault must not take the whole
+// service down: every player on this box loses their match when it does, and a
+// crash loop is what gets the deployment marked failed. Installed before the
+// requires below so even a load-time failure is reported instead of exiting 1.
+process.on('uncaughtException', (err) => {
+    console.error('[PROCESS] uncaught exception:', err);
+});
+process.on('unhandledRejection', (reason) => {
+    console.error('[PROCESS] unhandled rejection:', reason);
+});
+
+// On Render an exit-1 with no visible reason is almost always a missing
+// dependency, which happens when the service's Root Directory is not the folder
+// that holds package.json, so `npm install` installed nothing. Say so plainly.
+function load(name) {
+    try {
+        return require(name);
+    } catch (err) {
+        console.error(
+            `[BOOT] Cannot load "${name}": ${err.message}\n` +
+            `[BOOT] Fix on Render -> Settings:\n` +
+            `[BOOT]   Root Directory = the folder that contains package.json\n` +
+            `[BOOT]   Build Command  = npm install\n` +
+            `[BOOT]   Start Command  = node server.js\n` +
+            `[BOOT]   Node Version   = 18 or newer`
+        );
+        process.exitCode = 1;
+        throw err;
+    }
+}
+
+const express = load('express');
 const http = require('http');
-const { WebSocketServer, WebSocket } = require('ws');
-const cors = require('cors');
+const wsLib = load('ws');
+const WebSocketServer = wsLib.WebSocketServer || wsLib.Server;
+const WebSocket = wsLib.WebSocket;
+const cors = load('cors');
 
 const app = express();
 app.use(cors());
@@ -2710,12 +2743,9 @@ server.listen(PORT, () => {
     }
 });
 
-// One malformed packet or a momentary network fault must not take the whole
-// service down: every player on this box loses their match when it does, and a
-// crash loop is what gets the deployment marked failed.
-process.on('uncaughtException', (err) => {
-    console.error('[PROCESS] uncaught exception:', err);
-});
-process.on('unhandledRejection', (reason) => {
-    console.error('[PROCESS] unhandled rejection:', reason);
+server.on('error', (err) => {
+    console.error(`[BOOT] cannot listen on port ${PORT}: ${err.message}`);
+    if (err.code === 'EADDRINUSE') {
+        console.error('[BOOT] another process already owns this port.');
+    }
 });

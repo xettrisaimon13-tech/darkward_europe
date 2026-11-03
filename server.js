@@ -399,14 +399,57 @@ function removeFromAllQueues(ws) {
 // ==========================================
 // 0. CROSS-SERVER: HUB AND RELAY
 // ==========================================
-// One deployment is the hub (Asia 1, no HUB_URL) and owns every team, queue and
-// room. The other seven run with HUB_URL set and forward every player packet to
-// the hub, so a player on Europe meets a player on Oceania exactly like two
-// players on the same server. On the hub a relayed player is a plain object
-// that mimics a socket (send/readyState), which is why the whole game engine
-// below works on both without knowing which one it holds.
-const HUB_URL = process.env.HUB_URL || "";
+// One deployment is the hub (Asia 1) and owns every team, queue and room. The
+// other seven forward every player packet to it, so a player on Europe meets a
+// player on Oceania exactly like two players on the same server. On the hub a
+// relayed player is a plain object that mimics a socket (send/readyState), which
+// is why the whole game engine below works on both without knowing which one it
+// holds.
+// The fleet runs this one file with no per-service configuration: each
+// deployment reads its own RENDER_EXTERNAL_URL, and the service whose address is
+// HUB_HOST becomes the hub while every other one links itself to it. An explicit
+// HUB_URL still wins, which is how the local test harness runs eight processes
+// on one machine.
+const HUB_HOST = String(process.env.HUB_HOST || "dark-ward-sever.onrender.com").trim().toLowerCase();
 const HUB_RECONNECT_MS = 3000;
+
+function hostOf(url) {
+    return String(url || "").trim().toLowerCase()
+        .replace(/^wss?:\/\//, "").replace(/^https?:\/\//, "")
+        .split("/")[0].split("@").pop();
+}
+
+// A scheme the ws client can dial, or "" - never a throw, because a typo in one
+// dashboard field was enough to crash-loop a deployment out of existence.
+function asWsUrl(url) {
+    const raw = String(url || "").trim();
+    if (raw === "") return "";
+    if (/^(wss|ws):\/\//i.test(raw)) return raw;
+    if (/^https?:\/\//i.test(raw)) return raw.replace(/^http/i, "ws");
+    return "";
+}
+
+const selfHost = hostOf(process.env.RENDER_EXTERNAL_URL || process.env.SERVICE_URL || "");
+const autoHubUrl = (selfHost !== "" && selfHost !== HUB_HOST) ? "wss://" + HUB_HOST : "";
+
+let HUB_URL = autoHubUrl;
+if (process.env.HUB_URL !== undefined) {
+    const clean = asWsUrl(process.env.HUB_URL);
+    if (clean === "" && String(process.env.HUB_URL).trim() !== "") {
+        // A typo in the dashboard must not split the fleet: fall back to what this
+        // service's own address says its role is instead of quietly going private.
+        console.warn(`[CONFIG] HUB_URL="${process.env.HUB_URL}" is not a ws(s):// address. ` +
+            (autoHubUrl === "" ? "Running as the hub." : `Relaying to ${autoHubUrl} instead.`));
+    } else {
+        HUB_URL = clean;
+    }
+}
+// The hub pointing at itself is a loop, not a link: a relayed packet would leave
+// this process and come straight back to it.
+if (HUB_URL !== "" && hostOf(HUB_URL) === selfHost) HUB_URL = "";
+
+const REGION_ID = String(process.env.REGION_ID || selfHost ||
+    ("region_" + PORT + "_" + Math.random().toString(36).slice(2, 8)));
 
 // ---- relay mode (this process forwards its players to the hub) ----
 const connsById = new Map(); // connId -> local player socket
@@ -415,14 +458,20 @@ let hubWs = null;
 let hubTimer = null;
 
 function connectToHub() {
+    if (HUB_URL === "") return;
     if (hubWs && (hubWs.readyState === WebSocket.OPEN || hubWs.readyState === WebSocket.CONNECTING)) return;
-    hubWs = new WebSocket(HUB_URL);
+    try {
+        hubWs = new WebSocket(HUB_URL);
+    } catch (err) {
+        console.error('[RELAY] cannot dial hub URL:', err.message);
+        hubWs = null;
+        clearTimeout(hubTimer);
+        hubTimer = setTimeout(connectToHub, HUB_RECONNECT_MS);
+        return;
+    }
     hubWs.on('open', () => {
-        console.log(`[RELAY] linked to hub ${HUB_URL}`);
-        hubWs.send(JSON.stringify({
-            type: "hub_register",
-            region_id: process.env.REGION_ID || ("region_" + PORT + "_" + Math.random().toString(36).slice(2, 8))
-        }));
+        console.log(`[RELAY] linked to hub ${HUB_URL} as ${REGION_ID}`);
+        hubWs.send(JSON.stringify({ type: "hub_register", region_id: REGION_ID }));
         // Players who joined while the link was down are announced again.
         for (const ws of wss.clients) {
             if (!ws.isRegion && ws.connId) {
@@ -441,10 +490,31 @@ function connectToHub() {
     hubWs.on('close', () => {
         console.log('[RELAY] hub link dropped, retrying...');
         hubWs = null;
+        wakeHub();
         clearTimeout(hubTimer);
         hubTimer = setTimeout(connectToHub, HUB_RECONNECT_MS);
     });
     hubWs.on('error', () => {});
+}
+
+// The hub is the one service every region depends on, and a free instance sleeps
+// when nobody is knocking. A relay's own socket attempt does not wake it, so this
+// plain HTTP GET to its health root does - at most once a minute.
+let lastWakeAt = 0;
+
+function wakeHub() {
+    if (HUB_URL === "") return;
+    const now = Date.now();
+    if (now - lastWakeAt < 60000) return;
+    lastWakeAt = now;
+    try {
+        const host = hostOf(HUB_URL);
+        const req = http.get({ host: host, path: "/", timeout: 5000 }, (res) => res.resume());
+        req.on('error', () => {});
+        req.on('timeout', () => req.destroy());
+    } catch (err) {
+        console.error('[RELAY] hub wake-up failed:', err.message);
+    }
 }
 
 function relayToHub(ws, data) {
@@ -2631,8 +2701,21 @@ server.listen(PORT, () => {
     console.log(`===========================================`);
     console.log(`Flame Strike Server listening on port ${PORT}`);
     console.log(`WebSocket: ws://localhost:${PORT}`);
+    console.log(`Role: ${HUB_URL === "" ? "HUB (owns every queue, team and room)" : "RELAY -> " + HUB_URL}`);
+    console.log(`Region id: ${REGION_ID}`);
     console.log(`===========================================`);
     if (HUB_URL !== "") {
+        wakeHub();
         connectToHub();
     }
+});
+
+// One malformed packet or a momentary network fault must not take the whole
+// service down: every player on this box loses their match when it does, and a
+// crash loop is what gets the deployment marked failed.
+process.on('uncaughtException', (err) => {
+    console.error('[PROCESS] uncaught exception:', err);
+});
+process.on('unhandledRejection', (reason) => {
+    console.error('[PROCESS] unhandled rejection:', reason);
 });

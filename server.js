@@ -29,16 +29,10 @@ function load(name) {
     }
 }
 
-const express = load('express');
 const http = require('http');
 const wsLib = load('ws');
 const WebSocketServer = wsLib.WebSocketServer || wsLib.Server;
 const WebSocket = wsLib.WebSocket;
-const cors = load('cors');
-
-const app = express();
-app.use(cors());
-app.use(express.json());
 
 const PORT = process.env.PORT || 3000;
 
@@ -47,20 +41,56 @@ const PORT = process.env.PORT || 3000;
 // ==========================================
 const oauthTokens = new Map(); // state -> { access_token, refresh_token, expires_at, user }
 
+// ---- the handful of things express was doing ----
+// Written against node's own http so the only package this service needs to boot
+// is ws. Every response stays permissive exactly as cors() left it, and a body is
+// capped because a POST to this port can come from anywhere.
+const MAX_BODY_BYTES = 64 * 1024;
+
+function respond(res, status, type, body) {
+    res.writeHead(status, {
+        'Content-Type': type,
+        'Access-Control-Allow-Origin': '*',
+        'Access-Control-Allow-Headers': 'Content-Type',
+        'Access-Control-Allow-Methods': 'GET, POST, OPTIONS'
+    });
+    res.end(body);
+}
+
+function respondJson(res, status, obj) {
+    respond(res, status, 'application/json; charset=utf-8', JSON.stringify(obj));
+}
+
+function readBody(req, res, done) {
+    let raw = '';
+    let failed = false;
+    req.on('data', (chunk) => {
+        if (failed) return;
+        raw += chunk;
+        if (raw.length > MAX_BODY_BYTES) {
+            failed = true;
+            respondJson(res, 413, { error: "Body too large" });
+            req.destroy();
+        }
+    });
+    req.on('end', () => { if (!failed) done(raw); });
+    req.on('error', () => {});
+}
+
 // Health check endpoint
-app.get('/', (req, res) => {
-    res.json({
+function handleHealth(req, res) {
+    respondJson(res, 200, {
         status: "online",
         service: "Flame Strike Game Server",
         timestamp: new Date().toISOString()
     });
-});
+}
 
 // OAuth Callback from Supabase / Google
 // Supabase OAuth redirects with hash fragment (#access_token=...&refresh_token=...&state=...)
 // This page reads the hash and submits it back to the server
-app.get('/auth/callback', (req, res) => {
-    res.send(`
+function handleCallback(req, res) {
+    respond(res, 200, 'text/html; charset=utf-8', `
 <!DOCTYPE html>
 <html>
 <head>
@@ -109,49 +139,53 @@ app.get('/auth/callback', (req, res) => {
 </body>
 </html>
     `);
-});
+}
 
 // Internal endpoint to store extracted token
-app.post('/auth/save-token', (req, res) => {
-    const { state, access_token, refresh_token } = req.body;
-    console.log('[AUTH] Save-token called. State:', state, 'Token present:', !!access_token);
-    
-    if (access_token) {
-        const finalState = state || 'global_fallback';
-        oauthTokens.set(finalState, {
-            access_token,
-            refresh_token,
-            created_at: Date.now()
-        });
-        // Also store under global_fallback for Zero-State bridge
-        oauthTokens.set('global_fallback', {
-            access_token,
-            refresh_token,
-            created_at: Date.now()
-        });
-        // Auto cleanup after 5 minutes
-        setTimeout(() => {
-            oauthTokens.delete(finalState);
-            oauthTokens.delete('global_fallback');
-        }, 5 * 60 * 1000);
-        console.log('[AUTH] Token saved successfully for state:', finalState);
-        return res.json({ success: true });
-    }
-    res.status(400).json({ error: "Missing token" });
-});
+function handleSaveToken(req, res) {
+    readBody(req, res, (raw) => {
+        let body = {};
+        try { body = JSON.parse(raw || '{}'); } catch (err) { body = {}; }
+        const { state, access_token, refresh_token } = body;
+        console.log('[AUTH] Save-token called. State:', state, 'Token present:', !!access_token);
+
+        if (access_token) {
+            const finalState = state || 'global_fallback';
+            oauthTokens.set(finalState, {
+                access_token,
+                refresh_token,
+                created_at: Date.now()
+            });
+            // Also store under global_fallback for Zero-State bridge
+            oauthTokens.set('global_fallback', {
+                access_token,
+                refresh_token,
+                created_at: Date.now()
+            });
+            // Auto cleanup after 5 minutes
+            setTimeout(() => {
+                oauthTokens.delete(finalState);
+                oauthTokens.delete('global_fallback');
+            }, 5 * 60 * 1000);
+            console.log('[AUTH] Token saved successfully for state:', finalState);
+            respondJson(res, 200, { success: true });
+            return;
+        }
+        respondJson(res, 400, { error: "Missing token" });
+    });
+}
 
 // Godot polls this endpoint during login
-app.get('/auth/poll', (req, res) => {
-    const state = req.query.state;
+function handlePoll(req, res, state) {
     if (!state) {
-        return res.status(400).json({ error: "Missing state query param" });
+        return respondJson(res, 400, { error: "Missing state query param" });
     }
 
     // Try exact state match first
     if (oauthTokens.has(state)) {
         const tokenData = oauthTokens.get(state);
         oauthTokens.delete(state); // One-time use
-        return res.json({
+        return respondJson(res, 200, {
             access_token: tokenData.access_token,
             refresh_token: tokenData.refresh_token,
             pending: false
@@ -162,20 +196,38 @@ app.get('/auth/poll', (req, res) => {
     if (oauthTokens.has('global_fallback')) {
         const tokenData = oauthTokens.get('global_fallback');
         oauthTokens.delete('global_fallback'); // One-time use
-        return res.json({
+        return respondJson(res, 200, {
             access_token: tokenData.access_token,
             refresh_token: tokenData.refresh_token,
             pending: false
         });
     }
 
-    res.json({ pending: true });
-});
+    respondJson(res, 200, { pending: true });
+}
+
+// Everything that is not a websocket upgrade lands here: the four routes above,
+// and a plain 404 for the rest.
+function routeHttp(req, res) {
+    const path = String(req.url || '').split('?')[0];
+    if (req.method === 'OPTIONS') {
+        respond(res, 204, 'text/plain; charset=utf-8', '');
+        return;
+    }
+    if (req.method === 'GET' && path === '/') { handleHealth(req, res); return; }
+    if (req.method === 'GET' && path === '/auth/callback') { handleCallback(req, res); return; }
+    if (req.method === 'POST' && path === '/auth/save-token') { handleSaveToken(req, res); return; }
+    if (req.method === 'GET' && path === '/auth/poll') {
+        handlePoll(req, res, new URL(req.url, 'http://localhost').searchParams.get('state'));
+        return;
+    }
+    respondJson(res, 404, { error: "Not found" });
+}
 
 // ==========================================
 // 2. WEBSOCKET REAL-TIME MATCHMAKING
 // ==========================================
-const server = http.createServer(app);
+const server = http.createServer(routeHttp);
 const wss = new WebSocketServer({ server });
 
 // Mode queues: array of { ws, uid, team_size, character_id, username, player_uid }

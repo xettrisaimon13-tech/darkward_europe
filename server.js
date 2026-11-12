@@ -30,6 +30,7 @@ function load(name) {
 }
 
 const http = require('http');
+const crypto = require('crypto');
 const wsLib = load('ws');
 const WebSocketServer = wsLib.WebSocketServer || wsLib.Server;
 const WebSocket = wsLib.WebSocket;
@@ -82,6 +83,7 @@ function handleHealth(req, res) {
     respondJson(res, 200, {
         status: "online",
         service: "Flame Strike Game Server",
+        voice: !!(process.env.LIVEKIT_API_KEY && process.env.LIVEKIT_API_SECRET),
         timestamp: new Date().toISOString()
     });
 }
@@ -206,7 +208,76 @@ function handlePoll(req, res, state) {
     respondJson(res, 200, { pending: true });
 }
 
-// Everything that is not a websocket upgrade lands here: the four routes above,
+// ==========================================
+// VOICE (LiveKit) ACCESS TOKENS
+// ==========================================
+// The lobby voice chat runs on a LiveKit server. A client cannot be trusted
+// with the signing secret, so it asks this endpoint for a short-lived access
+// token instead. The token is a plain HS256 JWT, which node's own crypto can
+// sign - that keeps this service's only dependency at ws.
+//
+// The LiveKit server URL and its key/secret come from the environment, so the
+// same build works for LiveKit Cloud or a self-hosted box:
+//   LIVEKIT_URL         wss://xxxxx.livekit.cloud
+//   LIVEKIT_API_KEY     the project's API key
+//   LIVEKIT_API_SECRET  the project's API secret
+// Until those are set, /voice/token answers 503 and the game keeps voice off.
+const VOICE_TOKEN_TTL_SECONDS = 6 * 60 * 60;
+
+function base64url(input) {
+    return Buffer.from(input).toString('base64')
+        .replace(/\+/g, '-').replace(/\//g, '_').replace(/=+$/, '');
+}
+
+// Keeps an identity/room name to safe characters so it cannot smuggle
+// separators or grow without bound.
+function sanitizeId(value) {
+    return String(value || '').replace(/[^A-Za-z0-9_.-]/g, '').slice(0, 64);
+}
+
+function makeLiveKitToken(apiKey, apiSecret, identity, room) {
+    const now = Math.floor(Date.now() / 1000);
+    const header = { alg: 'HS256', typ: 'JWT' };
+    const payload = {
+        iss: apiKey,
+        sub: identity,
+        name: identity,
+        nbf: now - 5,
+        exp: now + VOICE_TOKEN_TTL_SECONDS,
+        video: {
+            room: room,
+            roomJoin: true,
+            canPublish: true,
+            canSubscribe: true,
+            canPublishData: true
+        }
+    };
+    const body = base64url(JSON.stringify(header)) + '.' + base64url(JSON.stringify(payload));
+    const sig = crypto.createHmac('sha256', apiSecret).update(body).digest();
+    return body + '.' + base64url(sig);
+}
+
+function handleVoiceToken(req, res) {
+    const apiKey = process.env.LIVEKIT_API_KEY;
+    const apiSecret = process.env.LIVEKIT_API_SECRET;
+    if (!apiKey || !apiSecret) {
+        return respondJson(res, 503, { error: "Voice not configured" });
+    }
+    const params = new URL(req.url, 'http://localhost').searchParams;
+    const identity = sanitizeId(params.get('identity'))
+        || ('guest-' + Math.random().toString(36).slice(2, 10));
+    const room = sanitizeId(params.get('room')) || 'lobby';
+    const token = makeLiveKitToken(apiKey, apiSecret, identity, room);
+    console.log('[VOICE] token issued for', identity, 'in room', room);
+    respondJson(res, 200, {
+        token: token,
+        url: process.env.LIVEKIT_URL || '',
+        room: room,
+        identity: identity
+    });
+}
+
+// Everything that is not a websocket upgrade lands here: the routes above,
 // and a plain 404 for the rest.
 function routeHttp(req, res) {
     const path = String(req.url || '').split('?')[0];
@@ -217,6 +288,7 @@ function routeHttp(req, res) {
     if (req.method === 'GET' && path === '/') { handleHealth(req, res); return; }
     if (req.method === 'GET' && path === '/auth/callback') { handleCallback(req, res); return; }
     if (req.method === 'POST' && path === '/auth/save-token') { handleSaveToken(req, res); return; }
+    if (req.method === 'GET' && path === '/voice/token') { handleVoiceToken(req, res); return; }
     if (req.method === 'GET' && path === '/auth/poll') {
         handlePoll(req, res, new URL(req.url, 'http://localhost').searchParams.get('state'));
         return;
@@ -564,7 +636,20 @@ function connectToHub() {
             }
         }
     });
-    hubWs.on('message', (message) => {
+    hubWs.on('message', (message, isBinary) => {
+        if (isBinary) {
+            // Voice relay from the hub: [0x59][1-byte len][connId][voice frame].
+            if (message.length > 3 && message[0] === 0x59) {
+                const len = message[1];
+                if (2 + len <= message.length) {
+                    const target = connsById.get(message.subarray(2, 2 + len).toString("utf8"));
+                    if (target && target.readyState === WebSocket.OPEN) {
+                        target.send(message.subarray(2 + len));
+                    }
+                }
+            }
+            return;
+        }
         let data;
         try { data = JSON.parse(message.toString()); } catch (e) { return; }
         if (data.type === "hub_to") {
@@ -624,6 +709,12 @@ function makePeer(regionId, connId) {
             if (l && l.ws.readyState === WebSocket.OPEN) {
                 l.ws.send(JSON.stringify({ type: "hub_to", conn: connId, data: text }));
             }
+        },
+        sendBinary: (buf) => {
+            const l = regionLinks.get(regionId);
+            if (l && l.ws.readyState === WebSocket.OPEN) {
+                l.ws.send(makeVoiceRelay(connId, buf));
+            }
         }
     };
     if (link) {
@@ -677,6 +768,66 @@ function dropRegionLink(ws) {
     console.log(`[HUB] region ${ws.regionId} dropped (${link.peers.size} players released)`);
 }
 
+// ---- voice relay ------------------------------------------------------------
+// Android phones run voice over the game socket instead of the LiveKit plugin
+// (its native layer SIGSEGVs there). A voice room is just a sanitized key the
+// hub groups sockets under: every 0x56 PCM frame a member sends is relayed to
+// the other members only. Regions never see the key, they only ferry frames.
+
+const voiceGroups = new Map(); // voiceKey -> Set of member bodies (socket or peer)
+const VOICE_FRAME_MAX = 4096;
+
+// Lobby and match keys are short ids, so a whitelist is the whole sanitizer.
+function sanitizeVoiceKey(raw) {
+    return String(raw || "").replace(/[^A-Za-z0-9_\-]/g, "").slice(0, 64);
+}
+
+function leaveVoice(ws) {
+    const key = ws.voiceKey;
+    if (!key) return;
+    ws.voiceKey = "";
+    const set = voiceGroups.get(key);
+    if (set && set.delete(ws)) {
+        if (set.size === 0) voiceGroups.delete(key);
+        else sendVoiceList(key);
+    }
+}
+
+function sendVoiceList(key) {
+    const set = voiceGroups.get(key);
+    if (!set) return;
+    const uids = [];
+    for (const body of set) {
+        if (body.playerUid && body.readyState === WebSocket.OPEN) uids.push(body.playerUid);
+    }
+    const txt = JSON.stringify({ type: "voice_list", voice_key: key, uids: uids });
+    for (const body of set) body.send(txt);
+}
+
+// A player's own frame: [0x56][16-byte uid][int16 LE PCM]. The uid rides along
+// so clients can mute per player without trusting the relay's routing.
+function relayVoice(ws, frame) {
+    const set = ws.voiceKey ? voiceGroups.get(ws.voiceKey) : null;
+    if (!set) return;
+    for (const body of set) {
+        if (body === ws) continue;
+        if (body.sendBinary) body.sendBinary(frame);
+        else body.send(frame);
+    }
+}
+
+// Region -> hub voice framing: [0x59][1-byte len][connId][voice frame]. The
+// connId is variable length, hence the length byte.
+function makeVoiceRelay(connId, frame) {
+    const id = Buffer.from(String(connId), "utf8");
+    const out = Buffer.alloc(2 + id.length + frame.length);
+    out[0] = 0x59;
+    out[1] = id.length;
+    id.copy(out, 2);
+    frame.copy(out, 2 + id.length);
+    return out;
+}
+
 wss.on('connection', (ws) => {
     console.log('[WS] New connection');
     ws.isAlive = true;
@@ -692,7 +843,32 @@ wss.on('connection', (ws) => {
         ws.isAlive = true;
     });
 
-    ws.on('message', (message) => {
+    ws.on('message', (message, isBinary) => {
+        if (isBinary) {
+            // 0x59 from a linked region is a member's voice frame; 0x56 from a
+            // player socket is the member itself. Anything else is ignored.
+            if (message.length > 3 && message[0] === 0x59) {
+                if (ws.isRegion) {
+                    const link = regionLinks.get(ws.regionId);
+                    const len = message[1];
+                    if (link && 2 + len <= message.length) {
+                        const peer = link.peers.get(message.subarray(2, 2 + len).toString("utf8"));
+                        if (peer) relayVoice(peer, message.subarray(2 + len));
+                    }
+                }
+                return;
+            }
+            if (message[0] === 0x56 && message.length >= 19 && message.length <= VOICE_FRAME_MAX) {
+                if (HUB_URL !== "") {
+                    if (hubWs && hubWs.readyState === WebSocket.OPEN) {
+                        hubWs.send(makeVoiceRelay(ws.connId, message));
+                    }
+                } else {
+                    relayVoice(ws, message);
+                }
+            }
+            return;
+        }
         let data;
         try {
             data = JSON.parse(message.toString());
@@ -734,6 +910,7 @@ wss.on('connection', (ws) => {
 // queue, team and room this body was part of hears about it exactly once.
 function dropPeer(ws) {
     console.log('[WS] Player disconnected');
+    leaveVoice(ws);
     if (ws.playerUid && clientsByUid.get(ws.playerUid) === ws) {
         clientsByUid.delete(ws.playerUid);
     }
@@ -791,6 +968,22 @@ function dropPeer(ws) {
     }
 }
 
+function spawnIndexForSeat(mode, sideIndex, seatIndex, slotSize) {
+    // Team spawn layout (Spawn 1..8 markers in Godot, 0-based indices here):
+    // 1v1: A=Spawn1, B=Spawn5
+    // 2v2: A=Spawn1,2, B=Spawn5,6
+    // 3v3: A=Spawn1,2,3, B=Spawn5,6,7
+    // 4v4: A=Spawn1,2,3,4, B=Spawn5,6,7,8
+    // Zombie Eclipse is authored/ring-mapped as 4v4 using contiguous 0..7.
+    if (mode === ZOMBIE_MODE) {
+        return sideIndex * slotSize + seatIndex;
+    }
+    const teamABase = 0; // Spawn 1
+    const teamBBase = 4; // Spawn 5
+    const base = sideIndex === 0 ? teamABase : teamBBase;
+    return base + seatIndex;
+}
+
 function makeRoom(mode, sides) {
     // One shared room for the whole opposing set: 1v1 = 2 players, 2v2 = 4,
     // 3v3 = 6, 4v4 = 8. Each side keeps a contiguous block of spawn indexes so
@@ -819,17 +1012,25 @@ function makeRoom(mode, sides) {
         console.warn(`[MATCH REJECTED] the same player was seated twice for ${mode}`);
         return false;
     }
+
+    const slotSize = sizeA;
+    const usedSpawns = new Set();
     const matchId = `match_${matchCounter++}`;
     const entries = [];
 
     sides.forEach((group, sideIndex) => {
-        const base = sideIndex * group.members.length;
         group.members.forEach((m, i) => {
             // The queue snapshot is a few seconds old by pairing time, while the
             // live party roster is not — so a member who equipped a different
             // character after the leader queued enters with the new one.
             const team = m.ws && m.ws.teamId ? teams.get(m.ws.teamId) : null;
             const live = team ? team.members.find(x => x.uid === m.playerUid) : null;
+            const spawnIndex = spawnIndexForSeat(mode, sideIndex, i, slotSize);
+            if (usedSpawns.has(spawnIndex)) {
+                console.warn(`[MATCH REJECTED] duplicate spawn ${spawnIndex} in ${mode}`);
+                return;
+            }
+            usedSpawns.add(spawnIndex);
             entries.push({
                 ws: m.ws,
                 uid: m.playerUid || "",
@@ -838,19 +1039,28 @@ function makeRoom(mode, sides) {
                 bundleId: live && live.bundleId !== undefined ? live.bundleId : bundleOf(m),
                 teamId: group.teamId || "",
                 side: sideIndex,
-                spawnIndex: base + i
+                team: sideIndex === 0 ? "A" : "B",
+                teamName: MUMMY_TEAM_NAMES[sideIndex] || (sideIndex === 0 ? "TEAM A" : "TEAM B"),
+                spawnIndex: spawnIndex,
+                spawnId: spawnIndex + 1
             });
         });
     });
+
+    if (entries.length !== seats.length || entries.length !== slotSize * 2) {
+        console.warn(`[MATCH REJECTED] seat/spawn assignment incomplete for ${mode} (${entries.length}/${slotSize * 2})`);
+        return false;
+    }
 
     const room = {
         players: entries.map(e => e.ws),
         mode: mode,
         matchId: matchId,
+        slotSize: slotSize,
         entries: entries
     };
     matches.set(matchId, room);
-    console.log(`[MATCH FOUND] ${entries.length} players in ${matchId} for ${mode} (${sides.map(s => s.teamId || 'solo').join(' vs ')})`);
+    console.log(`[MATCH FOUND] ${entries.length} bodies in ${matchId} for ${mode} ${slotSize}v${slotSize} (${sides.map(s => s.teamId || 'solo').join(' vs ')})`);
 
     for (const self of entries) {
         const enemy = entries.find(e => e.side !== self.side) || null;
@@ -859,9 +1069,13 @@ function makeRoom(mode, sides) {
             mode: mode,
             match_id: matchId,
             spawn_index: self.spawnIndex,
+            spawn_id: self.spawnId,
+            side: self.side,
+            team: self.team,
+            team_name: self.teamName,
             total_players: entries.length,
+            team_size: slotSize,
             team_id: self.teamId,
-            team_size: self.side === 0 ? sides[0].members.length : sides[1].members.length,
             players: entries.map(e => ({
                 id: mummyIdOf(e),
                 player_uid: e.uid,
@@ -869,6 +1083,10 @@ function makeRoom(mode, sides) {
                 character_id: e.characterId,
                 bundle_id: bundleOf(e),
                 spawn_index: e.spawnIndex,
+                spawn_id: e.spawnId,
+                side: e.side,
+                team: e.team,
+                team_name: e.teamName,
                 team_id: e.teamId
             })),
             // Kept for the arena client, which still labels the first enemy it sees.
@@ -876,12 +1094,17 @@ function makeRoom(mode, sides) {
                 character_id: enemy.characterId,
                 username: enemy.username,
                 player_uid: enemy.uid,
-                spawn_index: enemy.spawnIndex
+                spawn_index: enemy.spawnIndex,
+                spawn_id: enemy.spawnId,
+                side: enemy.side,
+                team: enemy.team
             } : {}
         };
         self.ws.matchId = matchId;
         self.ws.matchSpawnIndex = self.spawnIndex;
         self.ws.matchUid = self.uid;
+        self.ws.matchSide = self.side;
+        self.ws.matchTeam = self.team;
         sendJson(self.ws, payload);
     }
 
@@ -890,47 +1113,127 @@ function makeRoom(mode, sides) {
     return true;
 }
 
-// Teams queue as whole groups and only ever meet a group that asked for the
-// same mode and the same slot. Sizes are never mixed: a duo can only meet
-// another duo, a squad only a squad.
-function processTeamQueue(mode) {
-    if (!teamQueues[mode]) return;
-    let paired = true;
-    while (paired) {
-        paired = false;
-        const q = teamQueues[mode];
-        for (let i = 0; i < q.length && !paired; i++) {
-            for (let j = i + 1; j < q.length; j++) {
-                const a = q[i];
-                const b = q[j];
-                // Same queue key, same selected slot, and both parties are
-                // exactly as large as the slot they asked for. Anything else
-                // is a mismatch and must keep waiting.
-                if (a.slot !== b.slot) continue;
-                if (a.members.length !== a.slot || b.members.length !== b.slot) continue;
-                if (!a.members.every(m => queueEntryUsable(m, mode, a.slot))) continue;
-                if (!b.members.every(m => queueEntryUsable(m, mode, b.slot))) continue;
-                if (!makeRoom(mode, [a, b])) continue;
-                q.splice(j, 1);
-                q.splice(i, 1);
-                paired = true;
-                break;
+// ---- One queue, both pools ----
+// A search is keyed on (mode, slot) and nothing else: a party keeps its own
+// roster and seats a whole side, and the seats it left open are filled by the
+// players who searched that exact slot alone. Nothing is invented and nothing
+// is resized - a room opens only when every side is exactly the slot the players
+// themselves picked, so a pool that cannot reach slot * 2 real bodies just keeps
+// waiting. Fewest strangers first, so two parties that are already full meet
+// each other before a single one of their seats is handed to someone off the
+// street.
+function processMatchQueue(mode) {
+    if (!queues[mode] || !teamQueues[mode]) return;
+    for (const slot of TEAM_SLOTS) {
+        dropRepeatSoloEntries(mode, slot);
+        for (let guard = 0; guard < 16; guard++) {
+            const plan = planRoom(mode, slot);
+            if (!plan) break;
+            // makeRoom re-checks every socket, seat and side size one last time;
+            // a refusal leaves the whole pool exactly as it was.
+            if (!makeRoom(mode, plan.sides)) break;
+            for (const g of plan.groups) {
+                const idx = teamQueues[mode].indexOf(g);
+                if (idx !== -1) teamQueues[mode].splice(idx, 1);
+            }
+            for (const e of plan.solos) {
+                const idx = queues[mode].indexOf(e);
+                if (idx !== -1) queues[mode].splice(idx, 1);
             }
         }
     }
+    broadcastAllPools();
 }
 
-function queueTeam(mode, team, slot) {
+// The same body must never hold two seats in one pool: the newest search wins.
+function dropRepeatSoloEntries(mode, slot) {
+    const seen = new Set();
+    queues[mode] = queues[mode].filter(e => {
+        if (e.slot !== slot) return true;
+        if (seen.has(e.ws)) return false;
+        seen.add(e.ws);
+        return true;
+    });
+}
+
+function usableGroups(mode, slot) {
+    return teamQueues[mode].filter(g => g.slot === slot
+        && g.members.length <= slot
+        && g.members.every(m => queueEntryUsable(m, mode, slot)));
+}
+
+// Every way of filling one side out of whole parties, with the lone seats each
+// leaves. A slot is at most 4, so enumerating the subsets costs nothing and it
+// is the only honest way to find that a 3-party plus one searcher is a team.
+function sidePacks(groups, slot) {
+    const packs = [{ groups: [], openSeats: slot }];
+    for (const g of groups) {
+        const added = [];
+        for (const p of packs) {
+            const open = p.openSeats - g.members.length;
+            if (open < 0) continue;
+            added.push({ groups: p.groups.concat([g]), openSeats: open });
+        }
+        packs.push(...added);
+    }
+    packs.sort((a, b) => a.openSeats - b.openSeats || b.groups.length - a.groups.length);
+    return packs;
+}
+
+function planRoom(mode, slot) {
+    const groups = usableGroups(mode, slot);
+    const solos = queues[mode].filter(e => e.slot === slot && queueEntryUsable(e, mode, slot));
+    const packs = sidePacks(groups, slot);
+    for (const a of packs) {
+        for (const b of packs) {
+            if (a.groups.some(g => b.groups.includes(g))) continue;
+            if (a.openSeats + b.openSeats > solos.length) continue;
+            const mine = solos.slice(0, a.openSeats);
+            const theirs = solos.slice(a.openSeats, a.openSeats + b.openSeats);
+            return {
+                sides: [mixSide(a, mine), mixSide(b, theirs)],
+                groups: a.groups.concat(b.groups),
+                solos: mine.concat(theirs)
+            };
+        }
+    }
+    return null;
+}
+
+function mixSide(pack, soloSlice) {
+    const members = [];
+    for (const g of pack.groups) {
+        for (const m of g.members) members.push(m);
+    }
+    return {
+        // A side made of more than one source belongs to nobody's party.
+        teamId: pack.groups.length === 1 && soloSlice.length === 0 ? pack.groups[0].teamId : "",
+        members: members.concat(soloSlice)
+    };
+}
+
+function squadTargetSlot(mode, requestedSlot) {
+    // Match at the slot the player picked (1v1/2v2/3v3/4v4).
+    // Solo/party fillers are combined only within that same slot.
+    if (mode === MUMMY_MODE) return requestedSlot;
+    return requestedSlot;
+}
+
+function queueTeam(mode, team, requestedSlot) {
+    const slot = squadTargetSlot(mode, requestedSlot);
     const allyUidsOf = (uid) => team.members.filter(m => m.uid !== uid).map(m => m.uid);
     const group = {
         teamId: team.id,
         mode: mode,
         slot: slot,
+        requestedSlot: requestedSlot,
         teamSize: slot,
+        queuedAt: Date.now(),
         members: team.members.map(m => ({
             ws: m.ws,
             mode: mode,
             slot: slot,
+            requestedSlot: requestedSlot,
             characterId: m.characterId,
             bundleId: bundleOf(m),
             username: m.username,
@@ -946,12 +1249,12 @@ function queueTeam(mode, team, slot) {
             team_id: team.id,
             mode: mode,
             team_size: slot,
+            preferred_team_size: requestedSlot,
             player_count: group.members.length,
             required_players: slot * 2
         });
     }
-    // Every mode meets a party of the same size: duo v duo, trio v trio, squad v squad.
-    processTeamQueue(mode);
+    processMatchQueue(mode);
 }
 
 // A queued body is only usable while its socket is open, it is still asking for
@@ -964,16 +1267,21 @@ function queueEntryUsable(entry, mode, slot) {
         && !(entry.ws.matchId && matches.has(entry.ws.matchId));
 }
 
+// Everyone searching one (mode, slot) is competing for the same seats, so the
+// number a waiting phone is shown counts every body already sitting in that
+// pool: the lone searchers plus the members of any party short of the slot.
 function broadcastPoolStatus(mode, slot) {
     if (!queues[mode]) return;
     const pool = queues[mode].filter(e => e.slot === slot);
     const required = slot * 2;
+    let bodies = pool.filter(e => queueEntryUsable(e, mode, slot)).length;
+    for (const g of usableGroups(mode, slot)) bodies += g.members.length;
     for (const e of pool) {
         sendJson(e.ws, {
             type: "player_joined",
             mode: mode,
             team_size: slot,
-            player_count: pool.length,
+            player_count: Math.min(bodies, required),
             required_players: required
         });
     }
@@ -985,44 +1293,6 @@ function broadcastAllPools() {
     }
 }
 
-// Solo searches pool per (mode, slot) and only a full pool of slot * 2 bodies
-// starts a room: 1v1 for Solo, 2v2 for Duo, 3v3 for Trio, 4v4 for Squad.
-// Everything is re-checked here, immediately before the room is built, so a
-// cancel, a disconnect or a mode/slot switch can never leak into a match.
-function processSoloQueue(mode) {
-    if (!queues[mode]) return;
-    for (const slot of TEAM_SLOTS) {
-        const need = slot * 2;
-        for (let guard = 0; guard < 16; guard++) {
-            const ready = queues[mode].filter(e => queueEntryUsable(e, mode, slot));
-            if (ready.length < need) break;
-            const sockets = new Set(ready.map(e => e.ws));
-            if (sockets.size !== ready.length) {
-                // The same player queued twice: keep the newest entry only.
-                const seen = new Set();
-                queues[mode] = queues[mode].filter(e => {
-                    if (e.slot !== slot) return true;
-                    if (seen.has(e.ws)) return false;
-                    seen.add(e.ws);
-                    return true;
-                });
-                continue;
-            }
-            const group = ready.slice(0, need);
-            if (!group.every(e => queueEntryUsable(e, mode, slot))) break;
-            const started = makeRoom(mode, [
-                { teamId: "", members: group.slice(0, slot) },
-                { teamId: "", members: group.slice(slot) }
-            ]);
-            if (!started) break;
-            for (const e of group) {
-                const idx = queues[mode].indexOf(e);
-                if (idx !== -1) queues[mode].splice(idx, 1);
-            }
-        }
-    }
-    broadcastAllPools();
-}
 
 // ---- Mummy vs Human: server-authoritative 1v1 / 2v2 / 3v3 / 4v4 match ----
 // The clients only report proximity; every role, timer tick, knockdown, revive,
@@ -1065,16 +1335,18 @@ const ZOMBIE_TEAM_NAMES = ["TEAM TIGER", "TEAM LION"];
 // Which character owns which ability is decided here, not in the client's CATALOG,
 // so a tampered message cannot hand a player an ability they never equipped. Keep
 // this table and character_manager.gd's CATALOG "ability" rows in step.
-const CHARACTER_ABILITIES = { 2: "clone", 3: "aura", 4: "shield" };
+const CHARACTER_ABILITIES = { 2: "clone", 3: "aura", 4: "shield", 5: "hp_shield" };
 const CLONE_COUNT = 2;
 const CLONE_LIFETIME_MS = 10000;   // then it fades out on its own
 const CLONE_MAX_HITS = 3;          // or a Mummy lands three swings first
 const ABILITY_COOLDOWN_MS = 70000;
 // Mirrors ATTACK_RANGE in mummy_match.gd: the reach a catcher actually swings.
 const MUMMY_ATTACK_RANGE = parseFloat(process.env.MUMMY_ATTACK_RANGE) || 2.6;
-// How far either side of the Human's facing a clone stands.
-const CLONE_FLANK_METRES = 1.6;
-// Clones then walk straight ahead like bots, so they pull the Mummy's swing.
+// The decoys step out ahead of the Human, so they lead the caster instead of
+// appearing at their shoulder. A small side offset keeps the two of them apart.
+const CLONE_FRONT_METRES = 1.8;
+const CLONE_SPREAD_METRES = 0.55;
+// Clones then walk straight ahead from where they appeared.
 // Both ends use these two numbers: the phone draws the body on this line, and
 // the server moves its own copy down the same line, so a swing at what a player
 // sees is a swing on the body the server is counting.
@@ -1107,6 +1379,17 @@ const SHIELD_DESTROY_AT = 18;   // the dome gives out
 // in a crowd of four used to be able to spend a single press on four hits.
 const SHIELD_HIT_GAP_MS = 300;
 
+// ---- Character 5: Shadow Ranger personal shield ----
+// Extra HP layered over the normal bar. Damage spends this first; whatever is
+// left after 20 seconds disappears. The green body shell is drawn by every client.
+const HP_SHIELD_AMOUNT = 100;
+const HP_SHIELD_LIFETIME_MS = 20000;
+const HP_SHIELD_COOLDOWN_MS = 80000;
+
+function abilityCooldownMs(kind) {
+    return kind === "hp_shield" ? HP_SHIELD_COOLDOWN_MS : ABILITY_COOLDOWN_MS;
+}
+
 // 1v1 runs three minutes, every team size runs five.
 function mummyRoundMs(sideSize) {
     const forced = parseInt(process.env.MUMMY_ROUND_SECONDS, 10) || 0;
@@ -1134,11 +1417,13 @@ function initMummyMatch(room) {
         hunterSide: 0,             // the team hunting this round; it flips every round
         winnerSide: -1,            // -1 while the match is still live
         roles: {},                 // id -> "mummy" | "human"
-        combat: {},                // id -> { hp, downed, downedSince, eliminated, scored, reviveMs, revivers }
+        combat: {},                // id -> { hp, downed, downedSince, eliminated, scored, reviveMs, revivers, lastAttacker }
+        killEvents: [],            // { killerId, killerName, victimId, victimName, time, type }
         settled: false,            // one result per round, however it ends
         roundOutcome: "",
         abilities: {},             // id -> { cooldownUntil } for the equipped character's ability
         swingSeq: {},              // mummy id -> swings so far, so sword/jab alternate on every screen
+        lastSwingAt: {},           // mummy id -> ms of the last attack_anim, so a hit does not draw twice
         clones: {},                // clone id -> { owner, x, y, z, hits, expiresAt }
         cloneSeq: 0,
         shields: {},               // owner id -> { hits, x, y, z, expiresAt, lastHitAt }
@@ -1146,6 +1431,7 @@ function initMummyMatch(room) {
     };
     resetMummyCombat(room);
     resetMummyAbilities(room);
+    room.game.killEvents = [];
     broadcastMummyState(room, true);
 }
 
@@ -1157,6 +1443,8 @@ function resetMummyCombat(room) {
     for (const e of room.entries) {
         g.combat[mummyIdOf(e)] = {
             hp: MUMMY_HP,
+            shield: 0,
+            shieldUntil: 0,
             downed: false,
             downedSince: 0,
             eliminated: false,
@@ -1166,7 +1454,8 @@ function resetMummyCombat(room) {
             scored: false,
             reviveMs: 0,
             reviveAt: 0,
-            revivers: {}
+            revivers: {},
+            lastAttacker: null
         };
     }
 }
@@ -1290,8 +1579,9 @@ function tickMummyClones(room, now) {
         c.movedAt = now;
         const step = Math.min(CLONE_WALK_SPEED * dt, CLONE_WALK_LIMIT - c.walked);
         if (step > 0) {
-            c.x -= Math.sin(c.yaw) * step;
-            c.z -= Math.cos(c.yaw) * step;
+            // +Z is the way the model faces at yaw 0, so this walks it forwards.
+            c.x += Math.sin(c.yaw) * step;
+            c.z += Math.cos(c.yaw) * step;
             c.walked += step;
         }
     }
@@ -1305,6 +1595,27 @@ function activateMummyAbility(room, entry, now) {
     if (kind === "none") return "none";
     const mine = g.abilities[self] || (g.abilities[self] = { cooldownUntil: 0 });
     if (mine.cooldownUntil > now) return "cooldown";
+
+    if (kind === "hp_shield") {
+        const state = g.combat[self];
+        if (!state || state.downed || state.eliminated) return "none";
+        state.shield = HP_SHIELD_AMOUNT;
+        state.shieldUntil = now + HP_SHIELD_LIFETIME_MS;
+        mine.cooldownUntil = now + HP_SHIELD_COOLDOWN_MS;
+        for (const e of room.entries) {
+            sendJson(e.ws, {
+                type: "ability_spawn",
+                match_id: room.matchId,
+                player_id: self,
+                ability_type: "hp_shield",
+                shield_hp: HP_SHIELD_AMOUNT,
+                duration_ms: HP_SHIELD_LIFETIME_MS
+            });
+        }
+        broadcastMummyState(room, true);
+        console.log(`[MUMMY] ${self} raised a ${HP_SHIELD_AMOUNT} HP shadow shield in ${room.matchId}`);
+        return "";
+    }
 
     // The green aura is a burst on the spot: no body to track, no countdown beyond
     // the cooldown. Everyone is told where it bloomed so the phones agree.
@@ -1365,11 +1676,15 @@ function activateMummyAbility(room, entry, now) {
         return "";
     }
 
-    // The holograms flank the body that cast them, turned the way that body is
-    // already facing, so a clone never appears behind a player who has just
-    // spun around to run.
+    // The holograms step out in front of the body that cast them, turned the way
+    // that body is already facing, so a clone leads the caster instead of standing
+    // at their shoulder - and it never appears behind a player who has just spun
+    // around to run. The roster's models face +Z at yaw 0 (the player controller
+    // aims them with atan2(dx, dz), and the phone reports that same model yaw), so
+    // "ahead" is +Z here - the opposite sign would put the pair behind the caster.
     const at = entry.pos || { x: 0, y: 0, z: 0, yaw: 0 };
     const yaw = Number(at.yaw) || 0;
+    const forward = { x: Math.sin(yaw), z: Math.cos(yaw) };
     const right = { x: Math.cos(yaw), z: -Math.sin(yaw) };
     const created = [];
     for (let i = 0; i < CLONE_COUNT; i++) {
@@ -1377,9 +1692,9 @@ function activateMummyAbility(room, entry, now) {
         const id = `${self}#${g.cloneSeq++}`;
         const clone = {
             owner: self,
-            x: Number(at.x) + right.x * CLONE_FLANK_METRES * side,
+            x: Number(at.x) + forward.x * CLONE_FRONT_METRES + right.x * CLONE_SPREAD_METRES * side,
             y: Number(at.y),
-            z: Number(at.z) + right.z * CLONE_FLANK_METRES * side,
+            z: Number(at.z) + forward.z * CLONE_FRONT_METRES + right.z * CLONE_SPREAD_METRES * side,
             yaw: yaw,
             hits: 0,
             lastHitAt: 0,
@@ -1509,6 +1824,23 @@ function tickMummyShields(room, now) {
     return destroyMummyShields(room, dead);
 }
 
+// The blue body shield lasts exactly 20 seconds, and the server's clock is what
+// ends it so every phone drops the effect on the same tick.
+function tickMummyHpShields(room, now) {
+    const g = room.game;
+    let changed = false;
+    for (const id of Object.keys(g.combat)) {
+        const c = g.combat[id];
+        if (!c) continue;
+        if ((c.shield || 0) > 0 && c.shieldUntil > 0 && c.shieldUntil <= now) {
+            c.shield = 0;
+            c.shieldUntil = 0;
+            changed = true;
+        }
+    }
+    return changed;
+}
+
 // The dome that covers `targetId`: it has to be the target's own team's shield, and
 // the target has to be inside its footprint. A catcher standing inside a dome is
 // not protected by it - the shell only ever guards the team that raised it.
@@ -1579,14 +1911,15 @@ function reviveMummyPlayer(room, id) {
     if (!c || !c.downed) return false;
     c.downed = false;
     c.downedSince = 0;
-    c.hp = MUMMY_HP;
+    // A revived player stands back up at half health, not a fresh full bar.
+    c.hp = Math.floor(MUMMY_HP / 2);
     c.reviveMs = 0;
     c.reviveAt = 0;
     c.revivers = {};
     return true;
 }
 
-function eliminateMummyPlayer(room, id) {
+function eliminateMummyPlayer(room, id, killerId) {
     const c = room.game.combat[id];
     if (!c || c.eliminated) return false;
     c.downed = false;
@@ -1596,6 +1929,21 @@ function eliminateMummyPlayer(room, id) {
     c.reviveMs = 0;
     c.reviveAt = 0;
     c.revivers = {};
+    // Record kill event for the kill feed
+    const killer = killerId || c.lastAttacker || null;
+    const victimEntry = room.entries.find(e => mummyIdOf(e) === id);
+    const killerEntry = killer ? room.entries.find(e => mummyIdOf(e) === killer) : null;
+    room.game.killEvents.push({
+        killerId: killer,
+        killerName: killerEntry ? killerEntry.username : null,
+        victimId: id,
+        victimName: victimEntry ? victimEntry.username : id,
+        time: Date.now(),
+        type: killer ? "kill" : "eliminated",
+        is_streamer: false
+    });
+    // Keep only recent (last 10)
+    if (room.game.killEvents.length > 10) room.game.killEvents.shift();
     // The elimination is the point: whoever went out hands a point to the team on
     // the other side of the arena, which is the team that put them there.
     awardMummyPoint(room, id);
@@ -1731,7 +2079,13 @@ function tickMummyCombat(room, now) {
             if (!holding.includes(r)) delete c.revivers[r];
         }
         if (holding.length > 0) {
-            if (c.reviveAt > 0) c.reviveMs += now - c.reviveAt;
+            if (c.reviveAt > 0) {
+                const held = now - c.reviveAt;
+                c.reviveMs += held;
+                // A teammate holding + pauses the bleed: skip this gap in the
+                // knockdown clock so the HP does not drain mid-revive.
+                c.downedSince += held;
+            }
             c.reviveAt = now;
         } else {
             c.reviveAt = 0;
@@ -1746,7 +2100,7 @@ function tickMummyCombat(room, now) {
         const bled = now - c.downedSince;
         c.hp = Math.max(0, Math.ceil(MUMMY_HP * (1 - bled / MUMMY_DOWN_MS)));
         if (bled >= MUMMY_DOWN_MS) {
-            eliminateMummyPlayer(room, id);
+            eliminateMummyPlayer(room, id, null);
             console.log(`[MUMMY] ${id} bled out in ${room.matchId}`);
         }
     }
@@ -1829,10 +2183,12 @@ function mummyStatePayload(room, self) {
             type: abilityFor(self),
             left_ms: cooldownLeft,
             ready: g.phase === "playing" && cooldownLeft === 0,
-            cooldown_ms: ABILITY_COOLDOWN_MS,
+            cooldown_ms: abilityCooldownMs(abilityFor(self)),
             // How long this character's cast stands for, and what it takes to end it.
-            duration_ms: abilityFor(self) === "shield" ? SHIELD_LIFETIME_MS : CLONE_LIFETIME_MS,
-            hits_to_destroy: abilityFor(self) === "shield" ? SHIELD_DESTROY_AT : CLONE_MAX_HITS
+            duration_ms: abilityFor(self) === "hp_shield" ? HP_SHIELD_LIFETIME_MS
+                : abilityFor(self) === "shield" ? SHIELD_LIFETIME_MS : CLONE_LIFETIME_MS,
+            hits_to_destroy: abilityFor(self) === "shield" ? SHIELD_DESTROY_AT : CLONE_MAX_HITS,
+            shield_hp: abilityFor(self) === "hp_shield" ? HP_SHIELD_AMOUNT : 0
         },
         // Every client rebuilds the holograms from this list, so a spawn or a
         // destroy that lands on one phone and not another self-corrects.
@@ -1842,8 +2198,10 @@ function mummyStatePayload(room, self) {
         shields: shieldPayload(room, now),
         players: room.entries.map(e => {
             const id = mummyIdOf(e);
-            const c = g.combat[id] || { hp: MUMMY_HP, downed: false, eliminated: false, reviveMs: 0, revivers: {} };
+            const c = g.combat[id] || { hp: MUMMY_HP, shield: 0, shieldUntil: 0, downed: false, eliminated: false, reviveMs: 0, revivers: {} };
             const downLeft = c.downed ? Math.max(0, Math.ceil((c.downedSince + MUMMY_DOWN_MS - now) / 1000)) : 0;
+            const shieldLeft = (c.shield || 0) > 0 && c.shieldUntil > 0
+                ? Math.max(0, Math.ceil((c.shieldUntil - now) / 1000)) : 0;
             return {
                 id: id,
                 player_uid: e.uid,
@@ -1854,13 +2212,25 @@ function mummyStatePayload(room, self) {
                 side: e.side,
                 role: g.roles[id] || "",
                 hp: c.hp,
+                shield: c.shield || 0,
+                shield_max: HP_SHIELD_AMOUNT,
+                shield_seconds_left: shieldLeft,
                 downed: c.downed,
                 eliminated: c.eliminated,
                 down_seconds_left: downLeft,
                 revive_seconds_left: c.downed ? Math.max(0, Math.ceil((MUMMY_REVIVE_MS - c.reviveMs) / 1000)) : 0,
                 reviving: c.downed && Object.keys(c.revivers).length > 0
             };
-        })
+        }),
+        kill_events: (room.game.killEvents || []).map(k => ({
+            killer_id: k.killerId,
+            killer_name: k.killerName,
+            victim_id: k.victimId,
+            victim_name: k.victimName,
+            time: k.time,
+            type: k.type,
+            is_streamer: !!k.is_streamer
+        }))
     };
 }
 
@@ -1888,6 +2258,8 @@ function tickMummyMatches() {
         // A dome's 15 seconds run on this clock too, so it closes on every phone at
         // the same tick whether or not the caster's own screen is still there.
         if (g.phase !== "finished") tickMummyShields(room, now);
+        // The Shadow Ranger shield's 20 seconds run on the same clock.
+        if (g.phase !== "finished") tickMummyHpShields(room, now);
 
         if (g.phase === "playing" && !g.settled) {
             tickMummyCombat(room, now);
@@ -1938,6 +2310,7 @@ function initZombieMatch(room) {
         roles: {},                 // id -> "zombie" | "human"
         infected: {},              // id -> true once turned this round (duplicate guard)
         swingSeq: {},              // zombie id -> swings so far, so the punch clips alternate
+        lastSwingAt: {},           // zombie id -> ms of the last attack_anim, so a touch does not draw twice
         settled: false,
         roundOutcome: "",
         winnerSide: -1,
@@ -2107,6 +2480,167 @@ function tickZombieMatches() {
     }
 }
 
+// ---- shared swing / hit authority ----
+// Every `swing_start` a phone sends calls exactly these four
+// functions, so one set of rules - role, alive check, shield, clone, range,
+// damage - decides every hit in the game no matter who proposed it.
+// One swing on every phone, from one counter, so sword and jab alternate in the
+// same order on all eight screens. The stamp is what lets the hit path below
+// skip a re-broadcast when the phone already announced the swing.
+function broadcastAttackAnim(room, attackerId) {
+    const g = room.game;
+    const swing = (g.swingSeq[attackerId] = (g.swingSeq[attackerId] || 0) + 1);
+    const clip = swing % 2 === 1 ? "Sword_Attack" : "Fighting_Left_Jab";
+    g.lastSwingAt[attackerId] = Date.now();
+    for (const e of room.entries) {
+        sendJson(e.ws, {
+            type: "attack_anim",
+            match_id: room.matchId,
+            player_id: attackerId,
+            clip: clip
+        });
+    }
+}
+
+// A hit must be visible even when the phone only reports the damage and never
+// sends swing_start: without this the catcher's body swings on its own screen
+// and stands still on everybody else's.
+function ensureAttackAnim(room, attackerId) {
+    const last = room.game.lastSwingAt[attackerId] || 0;
+    if (Date.now() - last < 700) return;
+    broadcastAttackAnim(room, attackerId);
+}
+
+function performMummySwing(room, attacker) {
+    const g = room.game;
+    if (g.phase !== "playing" || g.settled) return false;
+    const attackerId = mummyIdOf(attacker);
+    if (g.roles[attackerId] !== "mummy") return false;
+    if (!mummyAlive(room, attackerId)) return false;
+
+    broadcastAttackAnim(room, attackerId);
+    return true;
+}
+
+function performMummyAttack(room, attacker, targetId) {
+    const g = room.game;
+    if (g.phase !== "playing" || g.settled) return false;
+
+    const attackerId = mummyIdOf(attacker);
+    if (g.roles[attackerId] !== "mummy") return false;
+    if (!mummyAlive(room, attackerId)) return false;
+
+    if (!room.entries.some(e => mummyIdOf(e) === targetId)) return false;
+    if (targetId === attackerId || g.roles[targetId] !== "human") return false;
+
+    const target = g.combat[targetId];
+    if (!target || target.downed || target.eliminated) return false;
+
+    // The claw has to read on every phone: a hit reported without its swing
+    // still gets one drawn here.
+    ensureAttackAnim(room, attackerId);
+
+    // A dome standing over the body takes the swing first. However many
+    // teammates are inside it, one press is one hit on the shell.
+    const guardId = shieldCovering(room, targetId);
+    if (guardId !== "") {
+        landShieldHit(room, guardId, Date.now());
+        console.log(`[MUMMY] ${attackerId} hit ${guardId}'s shield instead of ${targetId} in ${room.matchId}`);
+        return true;
+    }
+
+    // A hologram standing between the catcher and the body it swung at
+    // takes the blow. Deciding it here rather than on the catcher's phone
+    // is what makes all eight screens agree on who was actually hit.
+    const targetEntry = room.entries.find(e => mummyIdOf(e) === targetId);
+    const baitId = cloneAbsorbing(room, attacker.pos, targetEntry ? targetEntry.pos : null);
+    if (baitId !== "") {
+        landCloneHit(room, baitId, Date.now());
+        console.log(`[MUMMY] ${attackerId} hit clone ${baitId} instead of ${targetId} in ${room.matchId}`);
+        return true;
+    }
+
+    // Apply damage: the blue shield is extra HP laid over the normal bar, so it
+    // spends first and the body only starts losing HP once it is gone.
+    let incoming = MUMMY_DAMAGE_PER_HIT;
+    if ((target.shield || 0) > 0) {
+        const absorbed = Math.min(target.shield, incoming);
+        target.shield -= absorbed;
+        incoming -= absorbed;
+        if (target.shield <= 0) {
+            target.shield = 0;
+            target.shieldUntil = 0;
+        }
+        console.log(`[MUMMY] ${targetId}'s shadow shield absorbed ${absorbed}, ${target.shield} left`);
+    }
+    target.hp = Math.max(0, target.hp - incoming);
+    target.lastAttacker = attackerId;
+    console.log(`[MUMMY] ${attackerId} hit ${targetId} for ${incoming} damage, HP now ${target.hp}`);
+
+    // Check if HP reached zero
+    if (target.hp <= 0) {
+        if (g.sideSize <= 1) {
+            // 1v1: HP=0 ends the round immediately
+            if (!eliminateMummyPlayer(room, targetId, attackerId)) return true;
+            console.log(`[MUMMY] ${attackerId} caught ${targetId} out in ${room.matchId}`);
+            if (g.phase !== "finished") settleMummyRound(room, "mummy");
+        } else {
+            // 2v2+: HP=0 knocks down instead of eliminating
+            if (!downMummyPlayer(room, targetId)) return true;
+            console.log(`[MUMMY] ${attackerId} knocked ${targetId} down in ${room.matchId}`);
+            broadcastMummyState(room, true);
+        }
+    } else {
+        // Just damage, HP still > 0
+        broadcastMummyState(room, true);
+    }
+    return true;
+}
+
+function performZombieSwing(room, attacker) {
+    const g = room.game;
+    if (g.kind !== "zombie" || g.phase !== "playing" || g.settled) return false;
+    const attackerId = mummyIdOf(attacker);
+    if (g.roles[attackerId] !== "zombie") return false;
+
+    const swing = (g.swingSeq[attackerId] = (g.swingSeq[attackerId] || 0) + 1);
+    const clip = swing % 2 === 1 ? "Sword_Attack" : "Fighting_Left_Jab";
+    g.lastSwingAt[attackerId] = Date.now();
+    for (const e of room.entries) {
+        sendJson(e.ws, {
+            type: "attack_anim",
+            match_id: room.matchId,
+            player_id: attackerId,
+            clip: clip
+        });
+    }
+    return true;
+}
+
+function performZombieAttack(room, attacker, targetId) {
+    const g = room.game;
+    if (g.kind !== "zombie" || g.phase !== "playing" || g.settled) return false;
+
+    const attackerId = mummyIdOf(attacker);
+    if (g.roles[attackerId] !== "zombie") return false;
+
+    const target = room.entries.find(e => mummyIdOf(e) === targetId);
+    if (!target || targetId === attackerId || g.roles[targetId] !== "human") return false;
+
+    // The server owns the metre-stick as well as the infection: a swing at
+    // a body beyond arm plus a step of lag simply misses, on every screen.
+    if (flatDistance(attacker.pos, target.pos) > ZOMBIE_ATTACK_RANGE + 0.5) {
+        console.log(`[ZOMBIE] ${attackerId} swung at ${targetId} out of range in ${room.matchId}`);
+        return true;
+    }
+
+    ensureAttackAnim(room, attackerId);
+    if (infectZombie(room, attackerId, targetId)) {
+        broadcastZombieState(room, true);
+    }
+    return true;
+}
+
 function handleClientMessage(ws, data) {
     const type = data.type;
 
@@ -2158,7 +2692,7 @@ function handleClientMessage(ws, data) {
 
             if (!team) {
                 const maxSize = Math.min(4, Math.max(1, parseInt(data.max_size, 10) || 1));
-                if (maxSize < 2) { teamError(ws, "Pick Duo (2) or Squad (4) before inviting"); break; }
+                if (maxSize < 2) { teamError(ws, "Pick team size 2, 3 or 4 before inviting"); break; }
                 team = createTeam(ws, uid, data.username || "Player", data.character_id || 1, bundleIdOf(data), maxSize);
             }
             // Inviting is not a leader power: every member may bring their own
@@ -2261,23 +2795,22 @@ function handleClientMessage(ws, data) {
 
         // A lobby celebration is an event, not state: it does not belong in
         // anybody's team_update and must not be stored, because a late joiner
-        // should not watch an emote that already happened. The party is the only
-        // audience the lobby has, so the relay stops there.
+        // should not watch an emote that already happened. Broadcast to every
+        // connected lobby client so emotes sync globally, not just within a party.
         case 'lobby_emote': {
             const uid = bindUid(ws, data);
-            const team = teamOf(ws);
-            if (!team || !uid) break;
-            const emote = parseInt(data.emote, 10);
-            if (isNaN(emote) || emote < 1 || emote > 8) break;
+            if (!uid) break;
+            const emote = Number(data.emote);
+            if (!Number.isInteger(emote) || emote < 1 || emote > 16) break;
             const txt = JSON.stringify({
                 type: "lobby_emote",
                 emote: emote,
                 player_uid: uid,
                 username: String(data.username || "").slice(0, 24)
             });
-            for (const m of team.members) {
-                if (m.uid !== uid && m.ws.readyState === WebSocket.OPEN) {
-                    m.ws.send(txt);
+            for (const client of wss.clients) {
+                if (client !== ws && client.readyState === WebSocket.OPEN) {
+                    client.send(txt);
                 }
             }
             break;
@@ -2297,63 +2830,59 @@ function handleClientMessage(ws, data) {
                 sendJson(ws, { type: "mode_mismatch", mode: mode });
                 break;
             }
-            const slot = parseInt(data.team_size, 10);
-            if (!TEAM_SLOTS.includes(slot)) {
+            const requestedSlot = parseInt(data.team_size, 10);
+            if (!TEAM_SLOTS.includes(requestedSlot)) {
                 sendJson(ws, { type: "team_size_mismatch", team_size: data.team_size });
                 break;
             }
-            // A zombie queue has one shape: a full Squad on each side. Any other
-            // request would wait forever on the 4v4 room gate, so it is refused here.
-            if (mode === ZOMBIE_MODE && slot !== ZOMBIE_TEAM_SIZE) {
-                sendJson(ws, { type: "team_size_mismatch", team_size: slot, expected: ZOMBIE_TEAM_SIZE });
+            // A zombie room is Squad-sized on both sides and nothing else, so any
+            // other slot is refused here rather than left to wait on a gate it can
+            // never satisfy.
+            if (mode === ZOMBIE_MODE && requestedSlot !== ZOMBIE_TEAM_SIZE) {
+                sendJson(ws, { type: "team_size_mismatch", team_size: requestedSlot, expected: ZOMBIE_TEAM_SIZE });
                 break;
             }
             const characterId = data.character_id || 1;
             const bundleId = bundleIdOf(data);
             const username = data.username || "Player";
             const playerUid = uid || "";
+            const targetSlot = squadTargetSlot(mode, requestedSlot);
 
-            // The queue size is the server's roster, never the number the client
-            // claims — so a party can only ever meet a party of the same size.
             const team = teamOf(ws);
             if (team && team.members.length > 1) {
                 if (team.leaderUid !== playerUid) { teamError(ws, "Only the team leader can start matchmaking"); break; }
-                // The slot must be the party's real size. A party cannot search
-                // for a bigger or smaller lobby than the one it already has.
-                if (team.members.length !== slot) {
+                // Keep invited friends together in one party/team (never split).
+                // For squad-style Mummy matchmaking, target is 4-player squads.
+                if (team.members.length > targetSlot) {
                     sendJson(ws, {
                         type: "team_size_mismatch",
-                        team_size: slot,
+                        team_size: requestedSlot,
                         expected: team.members.length
                     });
                     break;
                 }
                 removeFromAllQueues(ws);
                 removeFromTeamQueue(team.id);
-                queueTeam(mode, team, slot);
+                queueTeam(mode, team, requestedSlot);
                 break;
             }
 
-            // Re-queueing is an update, not a second seat: the old entry (and any
-            // old slot/mode) is dropped before the new one is added.
+            // Re-queueing is an update, not a second seat.
             removeFromAllQueues(ws);
-            // One body can never be a 4v4 side: the infection mode is party-only.
-            if (mode === ZOMBIE_MODE) {
-                sendJson(ws, { type: "team_size_mismatch", team_size: slot, expected: ZOMBIE_TEAM_SIZE });
-                break;
-            }
             queues[mode].push({
                 ws,
                 mode,
-                slot,
+                slot: targetSlot,
+                requestedSlot: requestedSlot,
                 teamSize: 1,
                 characterId,
                 bundleId,
                 username,
-                playerUid
+                playerUid,
+                queuedAt: Date.now()
             });
-            console.log(`[QUEUE] ${playerUid || "solo"} joined ${mode} slot ${slot}. Waiting: ${queues[mode].filter(e => e.slot === slot).length}/${slot * 2}`);
-            processSoloQueue(mode);
+            console.log(`[QUEUE] ${playerUid || "solo"} joined ${mode} pref ${requestedSlot} -> target ${targetSlot}. Waiting: ${queues[mode].filter(e => e.slot === targetSlot).length}/${targetSlot * 2}`);
+            processMatchQueue(mode);
             break;
         }
 
@@ -2487,26 +3016,9 @@ function handleClientMessage(ws, data) {
         case 'swing_start': {
             const room = ws.matchId && matches.get(ws.matchId);
             if (!room || !room.game) break;
-
-            const g = room.game;
-            if (g.phase !== "playing" || g.settled) break;
-
             const attacker = room.entries.find(e => e.ws === ws);
             if (!attacker) break;
-            const attackerId = mummyIdOf(attacker);
-            if (g.roles[attackerId] !== "mummy") break;
-            if (!mummyAlive(room, attackerId)) break;
-
-            const swing = (g.swingSeq[attackerId] = (g.swingSeq[attackerId] || 0) + 1);
-            const clip = swing % 2 === 1 ? "Sword_Attack" : "Fighting_Left_Jab";
-            for (const e of room.entries) {
-                sendJson(e.ws, {
-                    type: "attack_anim",
-                    match_id: room.matchId,
-                    player_id: attackerId,
-                    clip: clip
-                });
-            }
+            performMummySwing(room, attacker);
             break;
         }
 
@@ -2516,64 +3028,9 @@ function handleClientMessage(ws, data) {
         case 'mummy_attack': {
             const room = ws.matchId && matches.get(ws.matchId);
             if (!room || !room.game) break;
-
-            const g = room.game;
-            if (g.phase !== "playing" || g.settled) break;
-
             const attacker = room.entries.find(e => e.ws === ws);
             if (!attacker) break;
-            const attackerId = mummyIdOf(attacker);
-            if (g.roles[attackerId] !== "mummy") break;
-            if (!mummyAlive(room, attackerId)) break;
-
-            const targetId = String(data.target_id || "");
-            if (!room.entries.some(e => mummyIdOf(e) === targetId)) break;
-            if (targetId === attackerId || g.roles[targetId] !== "human") break;
-
-            const target = g.combat[targetId];
-            if (!target || target.downed || target.eliminated) break;
-
-            // A dome standing over the body takes the swing first. However many
-            // teammates are inside it, one press is one hit on the shell.
-            const guardId = shieldCovering(room, targetId);
-            if (guardId !== "") {
-                landShieldHit(room, guardId, Date.now());
-                console.log(`[MUMMY] ${attackerId} hit ${guardId}'s shield instead of ${targetId} in ${room.matchId}`);
-                break;
-            }
-
-            // A hologram standing between the catcher and the body it swung at
-            // takes the blow. Deciding it here rather than on the catcher's phone
-            // is what makes all eight screens agree on who was actually hit.
-            const targetEntry = room.entries.find(e => mummyIdOf(e) === targetId);
-            const baitId = cloneAbsorbing(room, attacker.pos, targetEntry ? targetEntry.pos : null);
-            if (baitId !== "") {
-                landCloneHit(room, baitId, Date.now());
-                console.log(`[MUMMY] ${attackerId} hit clone ${baitId} instead of ${targetId} in ${room.matchId}`);
-                break;
-            }
-
-            // Apply damage
-            target.hp = Math.max(0, target.hp - MUMMY_DAMAGE_PER_HIT);
-            console.log(`[MUMMY] ${attackerId} hit ${targetId} for ${MUMMY_DAMAGE_PER_HIT} damage, HP now ${target.hp}`);
-
-            // Check if HP reached zero
-            if (target.hp <= 0) {
-                if (g.sideSize <= 1) {
-                    // 1v1: HP=0 ends the round immediately
-                    if (!eliminateMummyPlayer(room, targetId)) break;
-                    console.log(`[MUMMY] ${attackerId} caught ${targetId} out in ${room.matchId}`);
-                    if (g.phase !== "finished") settleMummyRound(room, "mummy");
-                } else {
-                    // 2v2+: HP=0 knocks down instead of eliminating
-                    if (!downMummyPlayer(room, targetId)) break;
-                    console.log(`[MUMMY] ${attackerId} knocked ${targetId} down in ${room.matchId}`);
-                    broadcastMummyState(room, true);
-                }
-            } else {
-                // Just damage, HP still > 0
-                broadcastMummyState(room, true);
-            }
+            performMummyAttack(room, attacker, String(data.target_id || ""));
             break;
         }
 
@@ -2583,54 +3040,18 @@ function handleClientMessage(ws, data) {
         case 'zombie_swing': {
             const room = ws.matchId && matches.get(ws.matchId);
             if (!room || !room.game || room.game.kind !== "zombie") break;
-
-            const g = room.game;
-            if (g.phase !== "playing" || g.settled) break;
-
             const attacker = room.entries.find(e => e.ws === ws);
             if (!attacker) break;
-            const attackerId = mummyIdOf(attacker);
-            if (g.roles[attackerId] !== "zombie") break;
-
-            const swing = (g.swingSeq[attackerId] = (g.swingSeq[attackerId] || 0) + 1);
-            const clip = swing % 2 === 1 ? "Sword_Attack" : "Fighting_Left_Jab";
-            for (const e of room.entries) {
-                sendJson(e.ws, {
-                    type: "attack_anim",
-                    match_id: room.matchId,
-                    player_id: attackerId,
-                    clip: clip
-                });
-            }
+            performZombieSwing(room, attacker);
             break;
         }
 
         case 'zombie_attack': {
             const room = ws.matchId && matches.get(ws.matchId);
             if (!room || !room.game || room.game.kind !== "zombie") break;
-
-            const g = room.game;
-            if (g.phase !== "playing" || g.settled) break;
-
             const attacker = room.entries.find(e => e.ws === ws);
             if (!attacker) break;
-            const attackerId = mummyIdOf(attacker);
-            if (g.roles[attackerId] !== "zombie") break;
-
-            const targetId = String(data.target_id || "");
-            const target = room.entries.find(e => mummyIdOf(e) === targetId);
-            if (!target || targetId === attackerId || g.roles[targetId] !== "human") break;
-
-            // The server owns the metre-stick as well as the infection: a swing at
-            // a body beyond arm plus a step of lag simply misses, on every screen.
-            if (flatDistance(attacker.pos, target.pos) > ZOMBIE_ATTACK_RANGE + 0.5) {
-                console.log(`[ZOMBIE] ${attackerId} swung at ${targetId} out of range in ${room.matchId}`);
-                break;
-            }
-
-            if (infectZombie(room, attackerId, targetId)) {
-                broadcastZombieState(room, true);
-            }
+            performZombieAttack(room, attacker, String(data.target_id || ""));
             break;
         }
 
@@ -2755,6 +3176,31 @@ function handleClientMessage(ws, data) {
                 target.reviveAt = 0;
                 broadcastMummyState(room, true);
             }
+            break;
+        }
+
+        // The lobby key is "lobby_<team_id>" and match keys reuse the room id,
+        // so a socket that changes rooms just re-keys. Leaving sends the rest of
+        // the room a fresh member list, and a dropped socket leaves silently.
+        case 'voice_join': {
+            const uid = bindUid(ws, data);
+            const key = sanitizeVoiceKey(data.voice_key);
+            if (!key || !uid) break;
+            leaveVoice(ws);
+            ws.voiceKey = key;
+            if (!voiceGroups.has(key)) voiceGroups.set(key, new Set());
+            voiceGroups.get(key).add(ws);
+            sendVoiceList(key);
+            break;
+        }
+
+        case 'voice_leave': {
+            leaveVoice(ws);
+            break;
+        }
+
+        case 'voice_list': {
+            if (ws.voiceKey) sendVoiceList(ws.voiceKey);
             break;
         }
 
